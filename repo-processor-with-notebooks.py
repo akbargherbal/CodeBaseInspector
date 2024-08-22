@@ -1,197 +1,134 @@
 import os
-import sys
 import argparse
-import re
-import tiktoken
-import subprocess
+import tempfile
+import git
 import json
 import logging
-from tqdm import tqdm
 from pathlib import Path
-from typing import List, Dict, Tuple
-import nbconvert
+import nbformat
+from nbconvert import MarkdownExporter
 
-def setup_logging(log_file: str):
-    logging.basicConfig(filename=log_file, level=logging.DEBUG,
-                        format='%(asctime)s - %(levelname)s - %(message)s',
-                        filemode='w')
+def setup_logging(log_file):
+    logging.basicConfig(filename=log_file, level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
 
-def clone_repository(repo_url: str, target_dir: str) -> None:
-    logging.info(f"Cloning repository: {repo_url} to {target_dir}")
-    subprocess.run(["git", "clone", repo_url, target_dir], check=True)
-    logging.info("Repository cloned successfully")
+def clone_or_use_local(repo_url_or_path, temp_dir):
+    if os.path.isdir(repo_url_or_path):
+        # It's a local directory, use it directly
+        return repo_url_or_path
+    else:
+        # It's a URL, clone it
+        return git.Repo.clone_from(repo_url_or_path, temp_dir).working_tree_dir
 
-def count_tokens(text: str) -> int:
-    encoding = tiktoken.get_encoding("cl100k_base")
-    return len(encoding.encode(text))
-
-def should_include_file(file_path: str, file_size: int, params: Dict) -> bool:
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    if ext in params['exclude_extensions']:
-        logging.debug(f"Excluded file due to extension: {file_path}")
-        return False
-    
-    if ext == '.json' and file_size > params['json_size_threshold']:
-        logging.debug(f"Excluded JSON file due to size: {file_path}")
-        return False
-    
-    if file_size > params['max_file_size']:
-        logging.debug(f"Excluded file due to size: {file_path}")
-        return False
-    
-    return True
-
-def convert_notebook_to_markdown(notebook_path: str) -> str:
-    logging.info(f"Converting notebook to markdown: {notebook_path}")
-    markdown_exporter = nbconvert.MarkdownExporter()
-    body, _ = markdown_exporter.from_filename(notebook_path)
-    
-    md_path = notebook_path.rsplit('.', 1)[0] + '.md'
-    with open(md_path, 'w', encoding='utf-8') as f:
-        f.write(body)
-    
-    logging.info(f"Notebook converted: {md_path}")
-    return md_path
-
-def process_directory(
-    path: str,
-    current_depth: int,
-    params: Dict,
-    output_file,
-    excluded_files: List[Tuple[str, int]]
-) -> None:
-    if current_depth > params['max_depth']:
-        logging.debug(f"Max depth reached: {path}")
-        return
-
-    items = sorted(os.listdir(path))
-    
-    for item in items:
-        item_path = os.path.join(path, item)
+def process_notebook(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as nb_file:
+            nb_contents = nbformat.read(nb_file, as_version=4)
         
-        if any(re.match(pattern, item_path) for pattern in params['ignore_patterns']):
-            logging.debug(f"Ignored item due to pattern: {item_path}")
-            continue
+        # Convert notebook to markdown
+        markdown_exporter = MarkdownExporter()
+        (body, _) = markdown_exporter.from_notebook_node(nb_contents)
         
-        if os.path.isdir(item_path):
-            output_file.write(f"{'  ' * current_depth}└── {item}/\n")
-            process_directory(item_path, current_depth + 1, params, output_file, excluded_files)
-        else:
-            file_size = os.path.getsize(item_path)
-            
-            if item.endswith('.ipynb'):
-                md_path = convert_notebook_to_markdown(item_path)
-                item_path = md_path
-                item = os.path.basename(md_path)
-                file_size = os.path.getsize(md_path)
-            
-            if should_include_file(item_path, file_size, params):
-                output_file.write(f"{'  ' * current_depth}├── {item}\n")
-                
-                try:
-                    with open(item_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
-                    if count_tokens(content) <= params['token_limit']:
-                        output_file.write(f"{'  ' * (current_depth + 1)}Content:\n")
-                        output_file.write(f"{content}\n\n")
-                    else:
-                        output_file.write(f"{'  ' * (current_depth + 1)}[Content excluded due to token limit]\n\n")
-                        logging.info(f"Content excluded due to token limit: {item_path}")
-                except Exception as e:
-                    logging.error(f"Error processing file {item_path}: {str(e)}")
-                    output_file.write(f"{'  ' * (current_depth + 1)}[Error processing file]\n\n")
+        return body
+    except Exception as e:
+        logging.error(f"Error processing notebook {file_path}: {str(e)}")
+        return f"[Error processing notebook: {str(e)}]"
+
+def process_file(file_path, token_limit, json_size_threshold):
+    try:
+        if file_path.suffix == '.ipynb':
+            return process_notebook(file_path)
+        
+        with open(file_path, 'r', encoding='utf-8') as file:
+            if file_path.suffix == '.json':
+                if os.path.getsize(file_path) > json_size_threshold:
+                    return "[JSON file larger than threshold]"
+                return json.load(file)
+            content = file.read()
+            if len(content.split()) > token_limit:
+                return f"[Content truncated due to token limit. First {token_limit} tokens shown]\n" + ' '.join(content.split()[:token_limit])
+            return content
+    except Exception as e:
+        logging.error(f"Error processing file {file_path}: {str(e)}")
+        return f"[Error processing file: {str(e)}]"
+
+def should_exclude(path, exclude_extensions, ignore_patterns, max_file_size):
+    if any(pattern in str(path) for pattern in ignore_patterns):
+        return True
+    if path.is_file():
+        if path.suffix in exclude_extensions:
+            return True
+        if os.path.getsize(path) > max_file_size:
+            return True
+    return False
+
+def process_directory(path, indent="", depth=0, max_depth=10, **kwargs):
+    if depth > max_depth:
+        return f"{indent}{path.name}/\n{indent}  [Max depth reached]\n"
+
+    result = f"{indent}{path.name}/\n"
+    try:
+        for item in sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name)):
+            if should_exclude(item, **kwargs):
+                continue
+            if item.is_dir():
+                result += process_directory(item, indent + "  ", depth + 1, max_depth, **kwargs)
             else:
-                output_file.write(f"{'  ' * current_depth}├── {item} [Excluded]\n")
-                excluded_files.append((item_path, file_size))
+                result += f"{indent}  {item.name}\n"
+                content = process_file(item, kwargs['token_limit'], kwargs['json_size_threshold'])
+                result += f"{indent}    Content:\n{indent}    {content.replace(chr(10), chr(10) + indent + '    ')}\n\n"
+    except Exception as e:
+        logging.error(f"Error processing directory {path}: {str(e)}")
+        result += f"{indent}  [Error processing directory: {str(e)}]\n"
+    return result
+
+def write_output(output, output_file, split_threshold):
+    if len(output) > split_threshold:
+        base, ext = os.path.splitext(output_file)
+        part = 1
+        while output:
+            with open(f"{base}_part{part}{ext}", 'w', encoding='utf-8') as f:
+                f.write(output[:split_threshold])
+            output = output[split_threshold:]
+            part += 1
+    else:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(output)
 
 def main():
-    parser = argparse.ArgumentParser(description="Clone and process a GitHub repository")
-    parser.add_argument("repo_url", help="URL of the GitHub repository to clone")
+    parser = argparse.ArgumentParser(description="Process a GitHub repository or local directory, including Jupyter notebooks.")
+    parser.add_argument("repo_url_or_path", help="GitHub repository URL or path to local directory")
     parser.add_argument("--token-limit", type=int, default=1000, help="Token limit for non-code text files")
-    parser.add_argument("--json-size-threshold", type=int, default=1024*1024, help="Size threshold for JSON files (in bytes)")
+    parser.add_argument("--json-size-threshold", type=int, default=1048576, help="Size threshold for JSON files in bytes")
     parser.add_argument("--exclude-extensions", nargs='+', default=['.csv', '.pt', '.pkl', '.bin', '.h5', '.parquet'], help="File extensions to exclude")
     parser.add_argument("--ignore-patterns", nargs='+', default=['node_modules', '.git'], help="Directories or file patterns to ignore")
     parser.add_argument("--max-depth", type=int, default=10, help="Maximum depth for directory tree processing")
-    parser.add_argument("--max-file-size", type=int, default=10*1024*1024, help="Maximum file size to include (in bytes)")
+    parser.add_argument("--max-file-size", type=int, default=10*1024*1024, help="Maximum file size to include in bytes")
     parser.add_argument("--output", default="repo_structure.txt", help="Output file name")
     parser.add_argument("--split-threshold", type=int, default=1000000, help="Token threshold for splitting output files")
     parser.add_argument("--log-file", default="repo_processing.log", help="Log file name")
-    
+
     args = parser.parse_args()
-    
+
     setup_logging(args.log_file)
-    logging.info("Starting repository processing")
-    
-    params = vars(args)
-    
-    temp_dir = "temp_repo"
-    clone_repository(args.repo_url, temp_dir)
-    
-    excluded_files = []
-    output_files = []
-    current_file = 1
-    current_tokens = 0
-    
-    output_file = open(f"{args.output}", 'w', encoding='utf-8')
-    output_files.append(output_file.name)
-    
-    logging.info("Processing repository structure")
-    process_directory(temp_dir, 0, params, output_file, excluded_files)
-    
-    logging.info("Listing excluded files")
-    for file_path, size in excluded_files:
-        logging.info(f"Excluded: {file_path} - {size} bytes")
-    
-    output_file.close()
-    
-    logging.info("Estimating total token count")
-    total_tokens = 0
-    for file_name in output_files:
-        with open(file_name, 'r', encoding='utf-8') as f:
-            content = f.read()
-            file_tokens = count_tokens(content)
-            total_tokens += file_tokens
-            logging.info(f"{file_name}: {file_tokens} tokens")
-    
-    logging.info(f"Total tokens: {total_tokens}")
-    
-    if total_tokens > args.split_threshold:
-        logging.info("Output exceeds split threshold. Splitting into multiple files.")
-        split_files = []
-        current_tokens = 0
-        current_content = ""
-        part = 1
-        
-        for file_name in output_files:
-            with open(file_name, 'r', encoding='utf-8') as f:
-                content = f.read()
-                content_tokens = count_tokens(content)
-                
-                if current_tokens + content_tokens > args.split_threshold:
-                    split_file_name = f"{args.output}.split{part}"
-                    with open(split_file_name, 'w', encoding='utf-8') as split_f:
-                        split_f.write(current_content)
-                    split_files.append(split_file_name)
-                    logging.info(f"Created split file: {split_file_name}")
-                    part += 1
-                    current_content = content
-                    current_tokens = content_tokens
-                else:
-                    current_content += content
-                    current_tokens += content_tokens
-        
-        if current_content:
-            split_file_name = f"{args.output}.split{part}"
-            with open(split_file_name, 'w', encoding='utf-8') as split_f:
-                split_f.write(current_content)
-            split_files.append(split_file_name)
-            logging.info(f"Created final split file: {split_file_name}")
-        
-        logging.info(f"Output split into {len(split_files)} files")
-    
-    logging.info("Processing complete")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            repo_path = clone_or_use_local(args.repo_url_or_path, temp_dir)
+            output = process_directory(
+                Path(repo_path),
+                max_depth=args.max_depth,
+                token_limit=args.token_limit,
+                json_size_threshold=args.json_size_threshold,
+                exclude_extensions=args.exclude_extensions,
+                ignore_patterns=args.ignore_patterns,
+                max_file_size=args.max_file_size
+            )
+            write_output(output, args.output, args.split_threshold)
+            logging.info(f"Processing completed. Output written to {args.output}")
+        except Exception as e:
+            logging.error(f"Error processing repository: {str(e)}")
+            print(f"An error occurred. Please check the log file {args.log_file} for details.")
 
 if __name__ == "__main__":
     main()
