@@ -77,8 +77,13 @@ def write_output(output, output_file, split_threshold):
             f.write(output)
 
 def main():
+<<<<<<< Updated upstream
     parser = argparse.ArgumentParser(description="Process a GitHub repository or local directory.")
     parser.add_argument("repo_url_or_path", help="GitHub repository URL or path to local directory")
+=======
+    parser = argparse.ArgumentParser(description="Process a GitHub repository or local directory")
+    parser.add_argument("path", help="URL of the GitHub repository or path to local directory")
+>>>>>>> Stashed changes
     parser.add_argument("--token-limit", type=int, default=1000, help="Token limit for non-code text files")
     parser.add_argument("--json-size-threshold", type=int, default=1048576, help="Size threshold for JSON files in bytes")
     parser.add_argument("--exclude-extensions", nargs='+', default=['.csv', '.pt', '.pkl', '.bin', '.h5', '.parquet'], help="File extensions to exclude")
@@ -92,6 +97,7 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.log_file)
+<<<<<<< Updated upstream
 
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
@@ -110,6 +116,82 @@ def main():
         except Exception as e:
             logging.error(f"Error processing repository: {str(e)}")
             print(f"An error occurred. Please check the log file {args.log_file} for details.")
+=======
+    logging.info("Starting repository/directory processing")
+    
+    params = vars(args)
+    
+    if args.path.startswith(('http://', 'https://', 'git://')):
+        temp_dir = "temp_repo"
+        clone_repository(args.path, temp_dir)
+        process_path = temp_dir
+    else:
+        process_path = args.path
+    
+    excluded_files = []
+    output_files = []
+    current_file = 1
+    current_tokens = 0
+    
+    output_file = open(f"{args.output}", 'w', encoding='utf-8')
+    output_files.append(output_file.name)
+    
+    logging.info("Processing repository/directory structure")
+    process_directory(process_path, 0, params, output_file, excluded_files)
+    
+    logging.info("Listing excluded files")
+    for file_path, size in excluded_files:
+        logging.info(f"Excluded: {file_path} - {size} bytes")
+    
+    output_file.close()
+    
+    logging.info("Estimating total token count")
+    total_tokens = 0
+    for file_name in output_files:
+        with open(file_name, 'r', encoding='utf-8') as f:
+            content = f.read()
+            file_tokens = count_tokens(content)
+            total_tokens += file_tokens
+            logging.info(f"{file_name}: {file_tokens} tokens")
+    
+    logging.info(f"Total tokens: {total_tokens}")
+    
+    if total_tokens > args.split_threshold:
+        logging.info("Output exceeds split threshold. Splitting into multiple files.")
+        split_files = []
+        current_tokens = 0
+        current_content = ""
+        part = 1
+        
+        for file_name in output_files:
+            with open(file_name, 'r', encoding='utf-8') as f:
+                content = f.read()
+                content_tokens = count_tokens(content)
+                
+                if current_tokens + content_tokens > args.split_threshold:
+                    split_file_name = f"{args.output}.split{part}"
+                    with open(split_file_name, 'w', encoding='utf-8') as split_f:
+                        split_f.write(current_content)
+                    split_files.append(split_file_name)
+                    logging.info(f"Created split file: {split_file_name}")
+                    part += 1
+                    current_content = content
+                    current_tokens = content_tokens
+                else:
+                    current_content += content
+                    current_tokens += content_tokens
+        
+        if current_content:
+            split_file_name = f"{args.output}.split{part}"
+            with open(split_file_name, 'w', encoding='utf-8') as split_f:
+                split_f.write(current_content)
+            split_files.append(split_file_name)
+            logging.info(f"Created final split file: {split_file_name}")
+        
+        logging.info(f"Output split into {len(split_files)} files")
+    
+    logging.info("Processing complete")
+>>>>>>> Stashed changes
 
 if __name__ == "__main__":
     main()
