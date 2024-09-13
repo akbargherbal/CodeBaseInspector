@@ -59,11 +59,15 @@ def process_directory(
         
         if any(re.match(pattern, item_path) for pattern in params['ignore_patterns']):
             logging.debug(f"Ignored item due to pattern: {item_path}")
+            output_file.write(f"{'  ' * current_depth}└── {item}/ [Ignored]\n")
             continue
         
         if os.path.isdir(item_path):
             output_file.write(f"{'  ' * current_depth}└── {item}/\n")
-            process_directory(item_path, current_depth + 1, params, output_file, excluded_files)
+            if item not in params['no_traverse_dirs']:
+                process_directory(item_path, current_depth + 1, params, output_file, excluded_files)
+            else:
+                logging.debug(f"Directory not traversed: {item_path}")
         else:
             file_size = os.path.getsize(item_path)
             
@@ -88,27 +92,32 @@ def process_directory(
                 excluded_files.append((item_path, file_size))
 
 def main():
-    parser = argparse.ArgumentParser(description="Clone and process a GitHub repository")
-    parser.add_argument("repo_url", help="URL of the GitHub repository to clone")
+    parser = argparse.ArgumentParser(description="Process a GitHub repository or local directory")
+    parser.add_argument("path", help="URL of the GitHub repository or path to local directory")
     parser.add_argument("--token-limit", type=int, default=1000, help="Token limit for non-code text files")
     parser.add_argument("--json-size-threshold", type=int, default=1024*1024, help="Size threshold for JSON files (in bytes)")
     parser.add_argument("--exclude-extensions", nargs='+', default=['.csv', '.pt', '.pkl', '.bin', '.h5', '.parquet'], help="File extensions to exclude")
-    parser.add_argument("--ignore-patterns", nargs='+', default=['node_modules', '.git'], help="Directories or file patterns to ignore")
+    parser.add_argument("--ignore-patterns", nargs='+', default=['node_modules', '.git', '__pycache__'], help="Directories or file patterns to ignore")
     parser.add_argument("--max-depth", type=int, default=10, help="Maximum depth for directory tree processing")
     parser.add_argument("--max-file-size", type=int, default=10*1024*1024, help="Maximum file size to include (in bytes)")
     parser.add_argument("--output", default="repo_structure.txt", help="Output file name")
     parser.add_argument("--split-threshold", type=int, default=1000000, help="Token threshold for splitting output files")
     parser.add_argument("--log-file", default="repo_processing.log", help="Log file name")
+    parser.add_argument("--no-traverse-dirs", nargs='+', default=['node_modules', '__pycache__'], help="Directories to list but not traverse")
     
     args = parser.parse_args()
     
     setup_logging(args.log_file)
-    logging.info("Starting repository processing")
+    logging.info("Starting repository/directory processing")
     
     params = vars(args)
     
-    temp_dir = "temp_repo"
-    clone_repository(args.repo_url, temp_dir)
+    if args.path.startswith(('http://', 'https://', 'git://')):
+        temp_dir = "temp_repo"
+        clone_repository(args.path, temp_dir)
+        process_path = temp_dir
+    else:
+        process_path = args.path
     
     excluded_files = []
     output_files = []
@@ -118,8 +127,8 @@ def main():
     output_file = open(f"{args.output}", 'w', encoding='utf-8')
     output_files.append(output_file.name)
     
-    logging.info("Processing repository structure")
-    process_directory(temp_dir, 0, params, output_file, excluded_files)
+    logging.info("Processing repository/directory structure")
+    process_directory(process_path, 0, params, output_file, excluded_files)
     
     logging.info("Listing excluded files")
     for file_path, size in excluded_files:
